@@ -1,0 +1,285 @@
+#name: $(Build.Repository.Name)-python-package
+#name: run_from_package
+
+trigger:
+  branches:
+    include:
+      #- main
+      - none
+
+pr:
+  branches:
+    include:
+      #- main
+      - none
+
+resources:
+  repositories:
+    - repository: tf_tpl
+      type: git
+      name: IaC/template
+      ref: refs/heads/main
+
+pool:
+  name: "IaCRunner"
+  demands:
+    - Agent.OS -equals Linux
+
+variables:
+  - name: env
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: "prod"
+    ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+      value: "dev"
+    ${{ if eq(variables['Build.SourceBranchName'], 'sbx') }}:
+      value: "sbx"
+  - name: subscription
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: "prod"
+    ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+      value: "nonprod"
+    ${{ if eq(variables['Build.SourceBranchName'], 'sbx') }}:
+      value: "sbx"
+  - name: azureServiceConnection
+    value: "sc-ccoe-iac-devops-${{ variables.subscription }}"
+  - name: webAppNamePrimary
+    value: "web-platform-eus-dev-python"
+  - name: webAppNameSecondary
+    value: ""
+  - name: webAppNameThird
+    value: ""
+  - name: packagePath
+    value: "$(Build.ArtifactStagingDirectory)/app.zip"
+  - name: pythonVersion
+    value: "3.12"
+  - name: packageRoot
+    value: "$(Build.ArtifactStagingDirectory)/package"
+
+stages:
+  - stage: Build
+    displayName: Build
+    jobs:
+      - job: Build
+        displayName: Build self-contained package
+        steps:
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              configurePythonCache: true
+              runPostJobCleanup: false
+
+          - checkout: self
+            clean: true
+            persistCredentials: false
+
+          - script: |
+              set -euo pipefail
+
+              resolve_python() {
+                local expected_version="$1"
+
+                for candidate in "python${expected_version}" python3 python; do
+                  if ! command -v "${candidate}" >/dev/null 2>&1; then
+                    continue
+                  fi
+
+                  local candidate_path
+                  local candidate_version
+                  candidate_path="$(command -v "${candidate}")"
+                  candidate_version="$("${candidate_path}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+                  if [ "${candidate_version}" = "${expected_version}" ]; then
+                    echo "${candidate_path}"
+                    return 0
+                  fi
+                done
+
+                return 1
+              }
+
+              PYTHON_BIN="$(resolve_python "$(pythonVersion)" || true)"
+              if [ -z "${PYTHON_BIN}" ]; then
+                echo "Python $(pythonVersion) was not found on the runner." >&2
+                echo "Install Python $(pythonVersion) on the self-hosted runner before using this pipeline." >&2
+                exit 1
+              fi
+
+              echo "Using Python interpreter: ${PYTHON_BIN}"
+              "${PYTHON_BIN}" --version
+              echo "##vso[task.setvariable variable=pythonExecutable]${PYTHON_BIN}"
+            displayName: Resolve Python $(pythonVersion) interpreter
+
+          - script: |
+              set -euo pipefail
+
+              PACKAGE_ROOT="$(packageRoot)"
+              SITE_PACKAGES_DIR="${PACKAGE_ROOT}/.python_packages/lib/site-packages"
+
+              rm -rf "${PACKAGE_ROOT}"
+              mkdir -p "${SITE_PACKAGES_DIR}"
+
+              "$(pythonExecutable)" -m pip install \
+                --break-system-packages \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --target "${SITE_PACKAGES_DIR}" \
+                -r requirements.txt
+
+              cp app.py "${PACKAGE_ROOT}/"
+              cp requirements.txt "${PACKAGE_ROOT}/"
+              cp -R templates "${PACKAGE_ROOT}/templates"
+              cp -R static "${PACKAGE_ROOT}/static"
+
+              find "${PACKAGE_ROOT}" -type d -name "__pycache__" -prune -exec rm -rf {} +
+              find "${PACKAGE_ROOT}" -type d -name "*.dist-info" -prune -exec rm -rf {} +
+            displayName: Build package contents
+
+          - script: |
+              set -euo pipefail
+
+              "$(pythonExecutable)" - <<'PY'
+              from pathlib import Path
+              from zipfile import ZIP_DEFLATED, ZipFile
+
+              source_dir = Path(r"$(packageRoot)")
+              archive_path = Path(r"$(packagePath)")
+              archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+              if archive_path.exists():
+                  archive_path.unlink()
+
+              with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as zf:
+                  for path in sorted(source_dir.rglob("*")):
+                      if path.is_file():
+                          zf.write(path, path.relative_to(source_dir))
+              PY
+            displayName: Archive application package
+
+          - publish: "$(packagePath)"
+            displayName: Publish artifact
+            artifact: drop
+
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              runInitialization: false
+              runPreJobCleanup: false
+              runCachePrep: false
+
+  - stage: Deploy
+    displayName: Deploy
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: Deploy
+        displayName: Deploy to Azure App Service
+        steps:
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              runPostJobCleanup: false
+
+          - download: current
+            displayName: Download artifact
+            artifact: drop
+
+          - task: AzureCLI@2
+            displayName: Deploy package-mounted web apps
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                packagePath="$(Pipeline.Workspace)/drop/app.zip"
+                pythonVersion="$(pythonVersion)"
+                startupCommand="gunicorn --bind=0.0.0.0 --timeout 600 --access-logfile '-' --error-logfile '-' --chdir /home/site/wwwroot app:app"
+                pythonPathSetting="/home/site/wwwroot/.python_packages/lib/site-packages"
+
+                test_scm_connectivity() {
+                  local host_name="$1"
+
+                  echo "Starting SCM connectivity preflight for ${host_name}..."
+
+                  if getent ahosts "${host_name}" > /tmp/scm_dns.txt 2>/tmp/scm_dns_err.txt; then
+                    awk '!seen[$1 FS $2]++ { printf("SCM resolved address [%s]: %s\n", $2, $1) }' /tmp/scm_dns.txt
+                  else
+                    cat /tmp/scm_dns_err.txt || true
+                    if command -v nslookup >/dev/null 2>&1; then
+                      nslookup "${host_name}" || true
+                    fi
+                    echo "Failed to resolve ${host_name} from the build agent." >&2
+                    exit 1
+                  fi
+
+                  echo "SCM TCP probe: testing ${host_name}:443"
+                  if ! timeout 10 bash -c "cat < /dev/null > /dev/tcp/${host_name}/443" 2>/tmp/scm_tcp_err.txt; then
+                    cat /tmp/scm_tcp_err.txt || true
+                    echo "Failed to reach https://${host_name} from the build agent." >&2
+                    exit 1
+                  fi
+                }
+
+                deploy_target() {
+                  local app_name="$1"
+
+                  if [ -z "${app_name}" ]; then
+                    echo "Deployment target is blank. Skipping."
+                    return 0
+                  fi
+
+                  local app_id
+                  local subscription_id
+                  local resource_group
+                  local scm_host
+
+                  app_id="$(az resource list --name "${app_name}" --resource-type "Microsoft.Web/sites" --query "[0].id" --output tsv)"
+                  if [ -z "${app_id}" ]; then
+                    echo "App Service '${app_name}' was not found. Skipping deployment."
+                    return 0
+                  fi
+
+                  subscription_id="$(echo "${app_id}" | cut -d/ -f3)"
+                  resource_group="$(echo "${app_id}" | cut -d/ -f5)"
+                  scm_host="${app_name}.scm.azurewebsites.net"
+
+                  echo "Deploying package-mounted app to ${app_name} in ${resource_group}..."
+                  az account set --subscription "${subscription_id}"
+                  test_scm_connectivity "${scm_host}"
+
+                  az webapp config set \
+                    --resource-group "${resource_group}" \
+                    --name "${app_name}" \
+                    --linux-fx-version "PYTHON|${pythonVersion}" \
+                    --startup-file "${startupCommand}"
+
+                  az webapp config appsettings delete \
+                    --resource-group "${resource_group}" \
+                    --name "${app_name}" \
+                    --setting-names SCM_DO_BUILD_DURING_DEPLOYMENT ENABLE_ORYX_BUILD || true
+
+                  az webapp config appsettings set \
+                    --resource-group "${resource_group}" \
+                    --name "${app_name}" \
+                    --settings \
+                      WEBSITE_RUN_FROM_PACKAGE=1 \
+                      PYTHONPATH="${pythonPathSetting}" \
+                      APP_SERVICE_NAME="${app_name}" \
+                      APP_SERVICE_SUBSCRIPTION_ID="${subscription_id}" \
+                      APP_SERVICE_RESOURCE_GROUP="${resource_group}"
+
+                  az webapp deploy \
+                    --resource-group "${resource_group}" \
+                    --name "${app_name}" \
+                    --src-path "${packagePath}" \
+                    --type zip \
+                    --restart true
+                }
+
+                deploy_target "$(webAppNamePrimary)"
+                deploy_target "$(webAppNameSecondary)"
+                deploy_target "$(webAppNameThird)"
+
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              runInitialization: false
+              runPreJobCleanup: false
+              runCachePrep: false
