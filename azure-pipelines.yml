@@ -1,0 +1,150 @@
+name: $(Build.Repository.Name)
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+      - dev
+      - sbx
+
+pr:
+  branches:
+    include:
+      - main
+      - dev
+      - sbx
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: IaC/template
+      ref: refs/heads/main
+
+pool:
+  name: "Azure Pipelines"
+  vmImage: "ubuntu-latest"
+
+variables:
+  - name: env
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: "prod"
+    ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+      value: "dev"
+    ${{ if eq(variables['Build.SourceBranchName'], 'sbx') }}:
+      value: "sbx"
+  - name: webAppNameSecondary
+    value: ""
+  - name: packagePath
+    value: "$(Build.ArtifactStagingDirectory)/app.zip"
+  - name: pythonVersion
+    value: "3.12"
+  - name: packageRoot
+    value: "$(Build.ArtifactStagingDirectory)/package"
+
+stages:
+  - stage: Build
+    displayName: Build
+    jobs:
+      - job: Build
+        displayName: Build package
+        steps:
+          - template: templates/shared-runner-hygiene.yml@templates
+            parameters:
+              configurePythonCache: true
+              runPostJobCleanup: false
+
+          - checkout: self
+            clean: true
+            persistCredentials: false
+
+          - task: UsePythonVersion@0
+            displayName: Use Python $(pythonVersion)
+            inputs:
+              versionSpec: "$(pythonVersion)"
+
+          - script: |
+              set -euo pipefail
+
+              echo "Using Python interpreter: $(command -v python)"
+              python --version
+            displayName: Resolve Python $(pythonVersion) interpreter
+
+          - script: |
+              set -euo pipefail
+
+              python -m pip install \
+                --disable-pip-version-check \
+                -r requirements.txt \
+                -r requirements-dev.txt
+              ruff check .
+              ruff format --check .
+              pytest
+              pip-audit -r requirements.txt
+            displayName: Validate application and dependencies
+
+          - script: |
+              set -euo pipefail
+
+              PACKAGE_ROOT="$(packageRoot)"
+
+              rm -rf "${PACKAGE_ROOT}"
+              mkdir -p "${PACKAGE_ROOT}"
+
+              cp app.py "${PACKAGE_ROOT}/"
+              cp requirements.txt "${PACKAGE_ROOT}/"
+              cp -R templates "${PACKAGE_ROOT}/templates"
+              cp -R static "${PACKAGE_ROOT}/static"
+
+              find "${PACKAGE_ROOT}" -type d -name "__pycache__" -prune -exec rm -rf {} +
+            displayName: Stage application files
+
+          - script: |
+              set -euo pipefail
+
+              python - <<'PY'
+              from pathlib import Path
+              from zipfile import ZIP_DEFLATED, ZipFile
+
+              source_dir = Path(r"$(packageRoot)")
+              archive_path = Path(r"$(packagePath)")
+              archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+              if archive_path.exists():
+                  archive_path.unlink()
+
+              with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as zf:
+                  for path in sorted(source_dir.rglob("*")):
+                      if path.is_file():
+                          zf.write(path, path.relative_to(source_dir))
+              PY
+            displayName: Archive application
+
+          - publish: "$(packagePath)"
+            displayName: Publish artifact
+            artifact: drop
+
+          - template: templates/shared-runner-hygiene.yml@templates
+            parameters:
+              runInitialization: false
+              runPreJobCleanup: false
+              runCachePrep: false
+
+  - template: azure-pipelines/deploy-stage.yml
+    parameters:
+      stageName: DeploySandbox
+      displayName: Deploy Sandbox
+      dependsOn: Build
+      azureServiceConnection: sc-platform-sbx
+      webAppNamePrimary: web-platform-cc-sbx-python
+      sourceBranch: refs/heads/sbx
+
+  - template: azure-pipelines/deploy-stage.yml
+    parameters:
+      stageName: DeployDev
+      displayName: Deploy Dev
+      dependsOn: Build
+      azureServiceConnection: sc-platform-dev
+      webAppNamePrimary: web-platform-eus-dev-python
+      sourceBranch: refs/heads/dev
