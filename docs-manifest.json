@@ -1,0 +1,12 @@
+{
+  "documents": [
+    "docs/ARCHITECTURE.md",
+    "docs/DEPLOYMENT_METHODS.md",
+    "docs/MOC.md",
+    "docs/PIPELINES.md",
+    "docs/VALIDATION.md",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "generatedAt": "2026-09-18T05:49:34Z"
+}
