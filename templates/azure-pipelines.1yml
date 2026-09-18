@@ -1,0 +1,551 @@
+
+name: $(Build.Repository.Name)
+
+trigger:
+  branches:
+    include:
+      #- main
+      - dev
+
+pr:
+  branches:
+    include:
+      #- main
+      - dev
+
+resources:
+  repositories:
+    - repository: tf_tpl
+      type: git
+      name: IaC/template
+      ref: refs/heads/main
+
+pool:
+  name: 'IaCRunner'
+  # demands:
+  #   - terraform
+  demands:
+  - Agent.OS -equals Linux
+
+variables:
+  - name: env
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: 'prod'
+    ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+      value: 'dev'
+    ${{ if eq(variables['Build.SourceBranchName'], 'sbx') }}:
+      value: 'sbx'
+  - name: subscription
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: 'prod'
+    ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+      value: 'nonprod'
+    ${{ if eq(variables['Build.SourceBranchName'], 'sbx') }}:
+      value: 'sbx'
+  - name: azureServiceConnection
+    value: 'sc-ccoe-iac-devops-${{variables.subscription}}'
+  - name: webAppNamePrimary
+    value: 'web-platform-eus-dev-python'
+  - name: webAppNameSecondary
+    value: ''
+    #value: ''
+  - name: webAppNameThird
+    value: ''
+  - name: packagePath
+    value: '$(Build.ArtifactStagingDirectory)/app.zip'
+  - name: pythonVersion
+    value: '3.12'
+  - name: backendSubscription
+    value: 'nonprod'
+  - name: backendResourceGroupName
+    value: 'rg-platform-dev'
+  - name: backendStorageAccountName
+    value: 'stccoeiacdev'
+  - name: backendContainerName
+    value: 'terraform'
+
+
+stages:
+  - stage: Build
+    displayName: Build
+    jobs:
+      - job: Build
+        displayName: Build package
+        steps:
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              configurePythonCache: true
+              runPostJobCleanup: false
+
+          - checkout: self
+            clean: true
+            persistCredentials: false
+
+          - script: |
+              set -e
+
+              resolve_python() {
+                if command -v python3.12 >/dev/null 2>&1; then
+                  echo "$(command -v python3.12)"
+                  return 0
+                fi
+
+                if command -v python >/dev/null 2>&1; then
+                  PYTHON_CANDIDATE="$(command -v python)"
+                  PYTHON_VERSION="$("$PYTHON_CANDIDATE" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+                  if [ "$PYTHON_VERSION" = "3.12" ]; then
+                    echo "$PYTHON_CANDIDATE"
+                    return 0
+                  fi
+                fi
+
+                if command -v python3 >/dev/null 2>&1; then
+                  PYTHON_CANDIDATE="$(command -v python3)"
+                  PYTHON_VERSION="$("$PYTHON_CANDIDATE" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+                  if [ "$PYTHON_VERSION" = "3.12" ]; then
+                    echo "$PYTHON_CANDIDATE"
+                    return 0
+                  fi
+                fi
+
+                return 1
+              }
+
+              PYTHON_BIN="$(resolve_python || true)"
+              if [ -z "$PYTHON_BIN" ]; then
+                echo "Python $(pythonVersion) was not found on the runner."
+                echo "Install Python $(pythonVersion) on the self-hosted runner before running this pipeline."
+                exit 1
+              fi
+
+              echo "Using Python interpreter: $PYTHON_BIN"
+              "$PYTHON_BIN" --version
+              echo "##vso[task.setvariable variable=pythonExecutable]$PYTHON_BIN"
+            displayName: Resolve Python $(pythonVersion) interpreter
+
+          - task: CopyFiles@2
+            displayName: Stage application files
+            inputs:
+              SourceFolder: '$(Build.SourcesDirectory)'
+              Contents: |
+                app.py
+                requirements.txt
+                templates/**
+                static/**
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/package'
+
+          - script: |
+              "$(pythonExecutable)" - <<'PY'
+              from pathlib import Path
+              from zipfile import ZIP_DEFLATED, ZipFile
+
+              source_dir = Path("$(Build.ArtifactStagingDirectory)/package")
+              archive_path = Path("$(packagePath)")
+              archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+              with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as zf:
+                  for path in source_dir.rglob("*"):
+                      if path.is_file():
+                          zf.write(path, path.relative_to(source_dir))
+              PY
+            displayName: Archive application
+
+          - publish: '$(packagePath)'
+            displayName: Publish artifact
+            artifact: drop
+
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              runInitialization: false
+              runPreJobCleanup: false
+              runCachePrep: false
+
+  - stage: Deploy
+    displayName: Deploy
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: Deploy
+        displayName: Deploy to Azure App Service
+        steps:
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              runPostJobCleanup: false
+
+          - task: AzureCLI@2
+            displayName: Check primary deployment target
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $appName = '$(webAppNamePrimary)'.Trim()
+                if ([string]::IsNullOrWhiteSpace($appName)) {
+                  Write-Host "##vso[task.logissue type=warning]webAppNamePrimary is not defined. Skipping deployment."
+                  Write-Host "##vso[task.setvariable variable=skipPrimaryDeployment]true"
+                  exit 0
+                }
+
+                $appId = az resource list --name $appName --resource-type "Microsoft.Web/sites" --query "[0].id" --output tsv
+                if ([string]::IsNullOrWhiteSpace($appId)) {
+                  Write-Host "##vso[task.logissue type=warning]App Service '$appName' was not found. Skipping deployment."
+                  Write-Host "##vso[task.setvariable variable=skipPrimaryDeployment]true"
+                  exit 0
+                }
+
+                Write-Host "App Service '$appName' found."
+                Write-Host "##vso[task.setvariable variable=skipPrimaryDeployment]false"
+                $subscriptionId = ($appId -split '/')[2]
+                $resourceGroup = ($appId -split '/')[4]
+                Write-Host "##vso[task.setvariable variable=primarySubscriptionId]$subscriptionId"
+                Write-Host "##vso[task.setvariable variable=primaryResourceGroup]$resourceGroup"
+
+          - task: AzureCLI@2
+            displayName: Check secondary deployment target
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $appName = '$(webAppNameSecondary)'.Trim()
+                if ([string]::IsNullOrWhiteSpace($appName)) {
+                  Write-Host "##vso[task.logissue type=warning]webAppNameSecondary is not defined. Skipping deployment."
+                  Write-Host "##vso[task.setvariable variable=skipSecondaryDeployment]true"
+                  exit 0
+                }
+
+                $appId = az resource list --name $appName --resource-type "Microsoft.Web/sites" --query "[0].id" --output tsv
+                if ([string]::IsNullOrWhiteSpace($appId)) {
+                  Write-Host "##vso[task.logissue type=warning]App Service '$appName' was not found. Skipping deployment."
+                  Write-Host "##vso[task.setvariable variable=skipSecondaryDeployment]true"
+                  exit 0
+                }
+
+                Write-Host "App Service '$appName' found."
+                Write-Host "##vso[task.setvariable variable=skipSecondaryDeployment]false"
+                $subscriptionId = ($appId -split '/')[2]
+                $resourceGroup = ($appId -split '/')[4]
+                Write-Host "##vso[task.setvariable variable=secondarySubscriptionId]$subscriptionId"
+                Write-Host "##vso[task.setvariable variable=secondaryResourceGroup]$resourceGroup"
+
+          - task: AzureCLI@2
+            displayName: Check third deployment target
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $appName = '$(webAppNameThird)'.Trim()
+                if ([string]::IsNullOrWhiteSpace($appName)) {
+                  Write-Host "##vso[task.logissue type=warning]webAppNameThird is not defined. Skipping deployment."
+                  Write-Host "##vso[task.setvariable variable=skipThirdDeployment]true"
+                  exit 0
+                }
+
+                $appId = az resource list --name $appName --resource-type "Microsoft.Web/sites" --query "[0].id" --output tsv
+                if ([string]::IsNullOrWhiteSpace($appId)) {
+                  Write-Host "##vso[task.logissue type=warning]App Service '$appName' was not found. Skipping deployment."
+                  Write-Host "##vso[task.setvariable variable=skipThirdDeployment]true"
+                  exit 0
+                }
+
+                Write-Host "App Service '$appName' found."
+                Write-Host "##vso[task.setvariable variable=skipThirdDeployment]false"
+                $subscriptionId = ($appId -split '/')[2]
+                $resourceGroup = ($appId -split '/')[4]
+                Write-Host "##vso[task.setvariable variable=thirdSubscriptionId]$subscriptionId"
+                Write-Host "##vso[task.setvariable variable=thirdResourceGroup]$resourceGroup"
+
+          - download: current
+            displayName: Download artifact
+            artifact: drop
+            condition: or(
+              ne(variables['skipPrimaryDeployment'], 'true'),
+              ne(variables['skipSecondaryDeployment'], 'true'),
+              ne(variables['skipThirdDeployment'], 'true')
+              )
+
+          - task: AzureCLI@2
+            displayName: Deploy primary web app
+            condition: ne(variables['skipPrimaryDeployment'], 'true')
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                appName="$(webAppNamePrimary)"
+                resourceGroup="$(primaryResourceGroup)"
+                subscriptionId="$(primarySubscriptionId)"
+                packagePath="$(Pipeline.Workspace)/drop/app.zip"
+                scmHost="${appName}.scm.azurewebsites.net"
+
+                test_scm_connectivity() {
+                  local host_name="$1"
+
+                  echo "Starting SCM connectivity preflight for ${host_name}..."
+                  echo "SCM DNS lookup results:"
+
+                  if getent ahosts "${host_name}" > /tmp/scm_dns.txt 2>/tmp/scm_dns_err.txt; then
+                    awk '!seen[$1 FS $2]++ { printf("SCM resolved address [%s]: %s\n", $2, $1) }' /tmp/scm_dns.txt
+                  else
+                    cat /tmp/scm_dns_err.txt || true
+                    if command -v nslookup >/dev/null 2>&1; then
+                      nslookup "${host_name}" || true
+                    fi
+                    echo "Failed to resolve ${host_name} from the build agent. If the App Service uses a private endpoint, ensure this self-hosted runner can resolve the SCM hostname through the private DNS zone and reach it over TCP 443." >&2
+                    exit 1
+                  fi
+
+                  if command -v host >/dev/null 2>&1; then
+                    echo "SCM canonical host details:"
+                    host "${host_name}" || true
+                  fi
+
+                  echo "SCM TCP probe: testing ${host_name}:443"
+                  if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${host_name}/443" 2>/tmp/scm_tcp_err.txt; then
+                    echo "SCM TCP probe succeeded for ${host_name}:443."
+                  else
+                    cat /tmp/scm_tcp_err.txt || true
+                    echo "Failed to reach https://${host_name} from the build agent. Private endpoint deployments require network access to the SCM/Kudu endpoint and a DNS record for ${appName}.scm.privatelink.azurewebsites.net." >&2
+                    exit 1
+                  fi
+
+                  local http_status
+                  if ! http_status="$(curl -I -sS -o /tmp/scm_headers.txt -w "%{http_code}" --connect-timeout 20 --max-time 30 "https://${host_name}/api/settings")"; then
+                    cat /tmp/scm_headers.txt 2>/dev/null || true
+                    echo "Failed to reach https://${host_name} from the build agent. Private endpoint deployments require network access to the SCM/Kudu endpoint and a DNS record for ${appName}.scm.privatelink.azurewebsites.net." >&2
+                    exit 1
+                  fi
+                  local status_line
+                  status_line="$(head -n 1 /tmp/scm_headers.txt | tr -d '\r')"
+                  echo "SCM HTTP probe returned status=${http_status} firstLine='${status_line}' from ${host_name}."
+                }
+
+                if [ -z "${subscriptionId}" ] || [ -z "${resourceGroup}" ]; then
+                  echo "Primary deployment metadata is incomplete. subscriptionId='${subscriptionId}' resourceGroup='${resourceGroup}'" >&2
+                  exit 1
+                fi
+
+                az account set --subscription "${subscriptionId}"
+                test_scm_connectivity "${scmHost}"
+                az webapp config set \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --linux-fx-version "PYTHON|$(pythonVersion)" \
+                  --startup-file "gunicorn --bind=0.0.0.0 --timeout 600 --access-logfile '-' --error-logfile '-' app:app"
+
+                az webapp config appsettings delete \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --setting-names WEBSITE_RUN_FROM_PACKAGE PYTHONPATH
+
+                az webapp config appsettings set \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --settings \
+                    SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+                    ENABLE_ORYX_BUILD=true \
+                    APP_SERVICE_NAME="${appName}" \
+                    APP_SERVICE_SUBSCRIPTION_ID="${subscriptionId}" \
+                    APP_SERVICE_RESOURCE_GROUP="${resourceGroup}"
+
+                az webapp deploy \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --src-path "${packagePath}" \
+                  --type zip \
+                  --restart true
+
+          - task: AzureCLI@2
+            displayName: Deploy secondary web app
+            condition: ne(variables['skipSecondaryDeployment'], 'true')
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                appName="$(webAppNameSecondary)"
+                resourceGroup="$(secondaryResourceGroup)"
+                subscriptionId="$(secondarySubscriptionId)"
+                packagePath="$(Pipeline.Workspace)/drop/app.zip"
+                scmHost="${appName}.scm.azurewebsites.net"
+
+                test_scm_connectivity() {
+                  local host_name="$1"
+
+                  echo "Starting SCM connectivity preflight for ${host_name}..."
+                  echo "SCM DNS lookup results:"
+
+                  if getent ahosts "${host_name}" > /tmp/scm_dns.txt 2>/tmp/scm_dns_err.txt; then
+                    awk '!seen[$1 FS $2]++ { printf("SCM resolved address [%s]: %s\n", $2, $1) }' /tmp/scm_dns.txt
+                  else
+                    cat /tmp/scm_dns_err.txt || true
+                    if command -v nslookup >/dev/null 2>&1; then
+                      nslookup "${host_name}" || true
+                    fi
+                    echo "Failed to resolve ${host_name} from the build agent. If the App Service uses a private endpoint, ensure this self-hosted runner can resolve the SCM hostname through the private DNS zone and reach it over TCP 443." >&2
+                    exit 1
+                  fi
+
+                  if command -v host >/dev/null 2>&1; then
+                    echo "SCM canonical host details:"
+                    host "${host_name}" || true
+                  fi
+
+                  echo "SCM TCP probe: testing ${host_name}:443"
+                  if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${host_name}/443" 2>/tmp/scm_tcp_err.txt; then
+                    echo "SCM TCP probe succeeded for ${host_name}:443."
+                  else
+                    cat /tmp/scm_tcp_err.txt || true
+                    echo "Failed to reach https://${host_name} from the build agent. Private endpoint deployments require network access to the SCM/Kudu endpoint and a DNS record for ${appName}.scm.privatelink.azurewebsites.net." >&2
+                    exit 1
+                  fi
+
+                  local http_status
+                  if ! http_status="$(curl -I -sS -o /tmp/scm_headers.txt -w "%{http_code}" --connect-timeout 20 --max-time 30 "https://${host_name}/api/settings")"; then
+                    cat /tmp/scm_headers.txt 2>/dev/null || true
+                    echo "Failed to reach https://${host_name} from the build agent. Private endpoint deployments require network access to the SCM/Kudu endpoint and a DNS record for ${appName}.scm.privatelink.azurewebsites.net." >&2
+                    exit 1
+                  fi
+                  local status_line
+                  status_line="$(head -n 1 /tmp/scm_headers.txt | tr -d '\r')"
+                  echo "SCM HTTP probe returned status=${http_status} firstLine='${status_line}' from ${host_name}."
+                }
+
+                if [ -z "${subscriptionId}" ] || [ -z "${resourceGroup}" ]; then
+                  echo "Secondary deployment metadata is incomplete. subscriptionId='${subscriptionId}' resourceGroup='${resourceGroup}'" >&2
+                  exit 1
+                fi
+
+                az account set --subscription "${subscriptionId}"
+                test_scm_connectivity "${scmHost}"
+                az webapp config set \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --linux-fx-version "PYTHON|$(pythonVersion)" \
+                  --startup-file "gunicorn --bind=0.0.0.0 --timeout 600 --access-logfile '-' --error-logfile '-' app:app"
+
+                az webapp config appsettings delete \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --setting-names WEBSITE_RUN_FROM_PACKAGE PYTHONPATH
+
+                az webapp config appsettings set \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --settings \
+                    SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+                    ENABLE_ORYX_BUILD=true \
+                    APP_SERVICE_NAME="${appName}" \
+                    APP_SERVICE_SUBSCRIPTION_ID="${subscriptionId}" \
+                    APP_SERVICE_RESOURCE_GROUP="${resourceGroup}"
+
+                az webapp deploy \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --src-path "${packagePath}" \
+                  --type zip \
+                  --restart true
+
+          - task: AzureCLI@2
+            displayName: Deploy third web app
+            condition: ne(variables['skipThirdDeployment'], 'true')
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                appName="$(webAppNameThird)"
+                resourceGroup="$(thirdResourceGroup)"
+                subscriptionId="$(thirdSubscriptionId)"
+                packagePath="$(Pipeline.Workspace)/drop/app.zip"
+                scmHost="${appName}.scm.azurewebsites.net"
+
+                test_scm_connectivity() {
+                  local host_name="$1"
+
+                  echo "Starting SCM connectivity preflight for ${host_name}..."
+                  echo "SCM DNS lookup results:"
+
+                  if getent ahosts "${host_name}" > /tmp/scm_dns.txt 2>/tmp/scm_dns_err.txt; then
+                    awk '!seen[$1 FS $2]++ { printf("SCM resolved address [%s]: %s\n", $2, $1) }' /tmp/scm_dns.txt
+                  else
+                    cat /tmp/scm_dns_err.txt || true
+                    if command -v nslookup >/dev/null 2>&1; then
+                      nslookup "${host_name}" || true
+                    fi
+                    echo "Failed to resolve ${host_name} from the build agent. If the App Service uses a private endpoint, ensure this self-hosted runner can resolve the SCM hostname through the private DNS zone and reach it over TCP 443." >&2
+                    exit 1
+                  fi
+
+                  if command -v host >/dev/null 2>&1; then
+                    echo "SCM canonical host details:"
+                    host "${host_name}" || true
+                  fi
+
+                  echo "SCM TCP probe: testing ${host_name}:443"
+                  if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${host_name}/443" 2>/tmp/scm_tcp_err.txt; then
+                    echo "SCM TCP probe succeeded for ${host_name}:443."
+                  else
+                    cat /tmp/scm_tcp_err.txt || true
+                    echo "Failed to reach https://${host_name} from the build agent. Private endpoint deployments require network access to the SCM/Kudu endpoint and a DNS record for ${appName}.scm.privatelink.azurewebsites.net." >&2
+                    exit 1
+                  fi
+
+                  local http_status
+                  if ! http_status="$(curl -I -sS -o /tmp/scm_headers.txt -w "%{http_code}" --connect-timeout 20 --max-time 30 "https://${host_name}/api/settings")"; then
+                    cat /tmp/scm_headers.txt 2>/dev/null || true
+                    echo "Failed to reach https://${host_name} from the build agent. Private endpoint deployments require network access to the SCM/Kudu endpoint and a DNS record for ${appName}.scm.privatelink.azurewebsites.net." >&2
+                    exit 1
+                  fi
+                  local status_line
+                  status_line="$(head -n 1 /tmp/scm_headers.txt | tr -d '\r')"
+                  echo "SCM HTTP probe returned status=${http_status} firstLine='${status_line}' from ${host_name}."
+                }
+
+                if [ -z "${subscriptionId}" ] || [ -z "${resourceGroup}" ]; then
+                  echo "Third deployment metadata is incomplete. subscriptionId='${subscriptionId}' resourceGroup='${resourceGroup}'" >&2
+                  exit 1
+                fi
+
+                az account set --subscription "${subscriptionId}"
+                test_scm_connectivity "${scmHost}"
+                az webapp config set \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --linux-fx-version "PYTHON|$(pythonVersion)" \
+                  --startup-file "gunicorn --bind=0.0.0.0 --timeout 600 --access-logfile '-' --error-logfile '-' app:app"
+
+                az webapp config appsettings delete \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --setting-names WEBSITE_RUN_FROM_PACKAGE PYTHONPATH
+
+                az webapp config appsettings set \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --settings \
+                    SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+                    ENABLE_ORYX_BUILD=true \
+                    APP_SERVICE_NAME="${appName}" \
+                    APP_SERVICE_SUBSCRIPTION_ID="${subscriptionId}" \
+                    APP_SERVICE_RESOURCE_GROUP="${resourceGroup}"
+
+                az webapp deploy \
+                  --resource-group "${resourceGroup}" \
+                  --name "${appName}" \
+                  --src-path "${packagePath}" \
+                  --type zip \
+                  --restart true
+
+          - template: templates/shared-runner-hygiene.yml@tf_tpl
+            parameters:
+              runInitialization: false
+              runPreJobCleanup: false
+              runCachePrep: false
