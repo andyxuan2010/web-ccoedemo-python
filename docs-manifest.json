@@ -1,0 +1,12 @@
+{
+  "generatedAt": "2026-09-18T03:14:53Z",
+  "documents": [
+    "docs/ARCHITECTURE.md",
+    "docs/DEPLOYMENT_METHODS.md",
+    "docs/MOC.md",
+    "docs/PIPELINES.md",
+    "docs/VALIDATION.md",
+    "README.md",
+    "SECURITY.md"
+  ]
+}
