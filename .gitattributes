@@ -1,0 +1,10 @@
+# Normalize text files to LF (matches the pre-commit mixed-line-ending --fix=lf hook).
+* text=auto eol=lf
+
+# Keep files excluded from the line-ending hook exactly as committed.
+reload-arm-env.ps1 -text
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.ico binary
