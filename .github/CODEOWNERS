@@ -1,0 +1,9 @@
+# Require repository-owner review for delivery and security-sensitive changes.
+/.github/ @andyxuan2010
+/azure-pipelines.yml @andyxuan2010
+/azure-pipelines/ @andyxuan2010
+/run_from_package.yml @andyxuan2010
+/app.py @andyxuan2010
+/requirements.txt @andyxuan2010
+/requirements-dev.txt @andyxuan2010
+/pyproject.toml @andyxuan2010
