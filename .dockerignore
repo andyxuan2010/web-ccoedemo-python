@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.ruff_cache
+.pytest_cache
+__pycache__
+pytest-cache-files-*
+.env
+.env.*
+!.env.example
+.vscode
+docs
+scripts
+tests
+_site
+site
+*.py[cod]
